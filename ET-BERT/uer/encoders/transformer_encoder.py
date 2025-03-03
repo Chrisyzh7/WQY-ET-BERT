@@ -18,7 +18,7 @@ class TransformerEncoder(nn.Module):
         self.relative_position_embedding = args.relative_position_embedding
 
         ###
-        self.margin_V = torch.nn.Parameter(torch.randn(args.emb_size, 1))
+        self.margin_V = nn.Parameter(torch.ones(1, 1, args.hidden_size))
 
         has_bias = bool(1 - args.remove_transformer_bias)
 

@@ -25,6 +25,11 @@ class Classifier(nn.Module):
     def __init__(self, args):
         super(Classifier, self).__init__()
         self.embedding = str2embedding[args.embedding](args, len(args.tokenizer.vocab))
+        # 添加词汇表大小匹配验证
+        print("=== Vocabulary Size Verification ===")
+        print("Tokenizer vocab size:", len(args.tokenizer.vocab))
+        print("Embedding weight size:", self.embedding.word_embedding.weight.size(0))
+        print("================================")
         self.encoder = str2encoder[args.encoder](args)
         self.labels_num = args.labels_num
         self.pooling = args.pooling
@@ -40,10 +45,19 @@ class Classifier(nn.Module):
             tgt: [batch_size]
             seg: [batch_size x seq_length]
         """
+        # 只在第一个批次输出信息
+        if not hasattr(self, 'printed_debug_info'):
+            print("=== Debug Information ===")
+            print("Input shape:", src.shape)
+            print("Max position index:", src.shape[1])
+            print("Max value in src:", src.max().item())
+            print("Word embedding size:", self.embedding.word_embedding.weight.size(0))
+            print("========================")
+            self.printed_debug_info = True
+        
         # Embedding.
         emb = self.embedding(src, seg)
-        print("Max index in src:", src.max().item())
-        print("Vocab size:", len(args.tokenizer.vocab))
+        
         # Encoder.
         output = self.encoder(emb, seg)
         temp_output = output
@@ -68,6 +82,18 @@ class Classifier(nn.Module):
         else:
             return None, logits
             #return temp_output, logits
+
+        # 添加范围检查
+        if not hasattr(self, 'checked_ranges'):
+            print("=== Embedding Range Check ===")
+            print("Word embedding range:", self.embedding.word_embedding.weight.size(0))
+            print("Position embedding range:", self.embedding.position_embedding.weight.size(0))
+            print("Segment embedding range:", self.embedding.segment_embedding.weight.size(0))
+            print("Input max token id:", src.max().item())
+            print("Input max position:", src.size(1))
+            print("Input max segment:", seg.max().item())
+            print("===========================")
+            self.checked_ranges = True
 
 
 def count_labels_num(path):
@@ -165,8 +191,23 @@ def read_dataset(args, path):
                 src = src[: args.seq_length]
                 seg = seg[: args.seq_length]
             while len(src) < args.seq_length:
-                src.append(0)
+                src.append(0)  # 填充索引
                 seg.append(0)
+
+            # 只在异常情况下输出警告
+            if max(src) >= len(args.tokenizer.vocab):
+                print(f"Warning: Token index out of vocabulary range in line {line_id}")
+                print(f"Max index: {max(src)}, Vocab size: {len(args.tokenizer.vocab)}")
+            
+            # 检查序列长度是否异常
+            if len(src) > args.seq_length * 1.5:  # 如果序列长度显著超过限制
+                print(f"Warning: Extremely long sequence in line {line_id}")
+                print(f"Sequence length: {len(src)}, Max length: {args.seq_length}")
+            
+            # 检查特殊标记
+            if src[0] != args.tokenizer.convert_tokens_to_ids([CLS_TOKEN])[0]:
+                print(f"Warning: Missing CLS token in line {line_id}")
+
             if args.soft_targets and "logits" in columns.keys():
                 dataset.append((src, tgt, seg, soft_tgt))
             else:
@@ -339,6 +380,16 @@ def main():
         else:
             model.load_state_dict(torch.load(args.output_model_path))
         evaluate(args, read_dataset(args, args.test_path), True)
+
+    # 确保 max_seq_length 至少等于 seq_length
+    if not hasattr(args, 'max_seq_length'):
+        args.max_seq_length = args.seq_length
+    elif args.max_seq_length < args.seq_length:
+        args.max_seq_length = args.seq_length
+
+    # 设置默认的 hidden_size
+    if not hasattr(args, 'hidden_size'):
+        args.hidden_size = 768  # BERT 的默认隐藏层大小
 
 
 if __name__ == "__main__":
