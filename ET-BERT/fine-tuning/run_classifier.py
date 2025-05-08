@@ -8,6 +8,7 @@ import random
 import argparse
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 from uer.layers import *
 from uer.encoders import *
 from uer.utils.vocab import Vocab
@@ -164,14 +165,21 @@ def batch_loader(batch_size, src, tgt, seg, soft_tgt=None):
             yield src_batch, tgt_batch, seg_batch, None
 
 
-def read_dataset(args, path):
+def read_dataset(args, path, max_samples=None):
     dataset, columns = [], {}
+    sample_count = 0
+    
     with open(path, mode="r", encoding="utf-8") as f:
         for line_id, line in enumerate(f):
             if line_id == 0:
                 for i, column_name in enumerate(line.strip().split("\t")):
                     columns[column_name] = i
                 continue
+                
+            # 检查是否已达到最大样本数
+            if max_samples is not None and sample_count >= max_samples:
+                break
+                
             line = line[:-1].split("\t")
             tgt = int(line[columns["label"]])
             if args.soft_targets and "logits" in columns.keys():
@@ -212,7 +220,10 @@ def read_dataset(args, path):
                 dataset.append((src, tgt, seg, soft_tgt))
             else:
                 dataset.append((src, tgt, seg))
-
+                
+            sample_count += 1
+            
+    print(f"Read {sample_count} samples from {path}")
     return dataset
 
 
@@ -235,52 +246,77 @@ def train_model(args, model, optimizer, scheduler, src_batch, tgt_batch, seg_bat
     return loss
 
 
-def evaluate(args, dataset, print_confusion_matrix=False):
-    src = torch.LongTensor([sample[0] for sample in dataset])
-    tgt = torch.LongTensor([sample[1] for sample in dataset])
-    seg = torch.LongTensor([sample[2] for sample in dataset])
+def create_dataloader(args, dataset, batch_size, shuffle=True):
+    """
+    创建优化的数据加载器，根据设备类型选择合适的配置
+    """
+    # 提取数据
+    if len(dataset[0]) == 4:  # 包含soft_tgt
+        src = torch.LongTensor([sample[0] for sample in dataset])
+        tgt = torch.LongTensor([sample[1] for sample in dataset])
+        seg = torch.LongTensor([sample[2] for sample in dataset])
+        soft_tgt = torch.FloatTensor([sample[3] for sample in dataset])
+        tensor_dataset = TensorDataset(src, tgt, seg, soft_tgt)
+    else:  # 不包含soft_tgt
+        src = torch.LongTensor([sample[0] for sample in dataset])
+        tgt = torch.LongTensor([sample[1] for sample in dataset])
+        seg = torch.LongTensor([sample[2] for sample in dataset])
+        tensor_dataset = TensorDataset(src, tgt, seg)
+    
+    # 根据设备类型选择合适的DataLoader配置
+    if args.device.type == 'cuda':
+        # GPU配置
+        return DataLoader(
+            tensor_dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=4,  # GPU训练使用多个工作进程
+            pin_memory=True  # 将数据固定在内存中，加速GPU访问
+        )
+    else:
+        # CPU配置
+        return DataLoader(
+            tensor_dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=2,  # CPU训练使用较少的工作进程
+            pin_memory=False
+        )
 
-    batch_size = args.batch_size
-
+def evaluate_with_dataloader(args, dataloader):
+    """
+    使用DataLoader进行评估
+    """
     correct = 0
+    total = 0
     # Confusion matrix.
     confusion = torch.zeros(args.labels_num, args.labels_num, dtype=torch.long)
 
     args.model.eval()
 
-    for i, (src_batch, tgt_batch, seg_batch, _) in enumerate(batch_loader(batch_size, src, tgt, seg)):
+    for batch in dataloader:
+        if len(batch) == 4:  # 包含soft_tgt
+            src_batch, tgt_batch, seg_batch, _ = batch
+        else:  # 不包含soft_tgt
+            src_batch, tgt_batch, seg_batch = batch
+            
         src_batch = src_batch.to(args.device)
         tgt_batch = tgt_batch.to(args.device)
         seg_batch = seg_batch.to(args.device)
+        
         with torch.no_grad():
             _, logits = args.model(src_batch, tgt_batch, seg_batch)
+        
         pred = torch.argmax(nn.Softmax(dim=1)(logits), dim=1)
         gold = tgt_batch
         for j in range(pred.size()[0]):
             confusion[pred[j], gold[j]] += 1
         correct += torch.sum(pred == gold).item()
+        total += pred.size()[0]
 
-    if print_confusion_matrix:
-        print("Confusion matrix:")
-        print(confusion)
-        cf_array = confusion.numpy()
-        with open("/data2/lxj/pre-train/results/confusion_matrix",'w') as f:
-            for cf_a in cf_array:
-                f.write(str(cf_a)+'\n')
-        print("Report precision, recall, and f1:")
-        eps = 1e-9
-        for i in range(confusion.size()[0]):
-            p = confusion[i, i].item() / (confusion[i, :].sum().item() + eps)
-            r = confusion[i, i].item() / (confusion[:, i].sum().item() + eps)
-            if (p + r) == 0:
-                f1 = 0
-            else:
-                f1 = 2 * p * r / (p + r)
-            print("Label {}: {:.3f}, {:.3f}, {:.3f}".format(i, p, r, f1))
-
-    print("Acc. (Correct/Total): {:.4f} ({}/{}) ".format(correct / len(dataset), correct, len(dataset)))
-    return correct / len(dataset), confusion
-
+    # 打印评估结果
+    print("Acc. (Correct/Total): {:.4f} ({}/{}) ".format(correct / total, correct, total))
+    return correct / total, confusion
 
 def main():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -301,6 +337,14 @@ def main():
                         help="Train model with logits.")
     parser.add_argument("--soft_alpha", type=float, default=0.5,
                         help="Weight of the soft targets loss.")
+                        
+    # 添加数据集大小限制参数
+    parser.add_argument("--max_train_samples", type=int, default=None,
+                        help="Maximum number of training samples to use (for testing/debugging).")
+    parser.add_argument("--max_dev_samples", type=int, default=None,
+                        help="Maximum number of dev samples to use (for testing/debugging).")
+    parser.add_argument("--max_test_samples", type=int, default=None,
+                        help="Maximum number of test samples to use (for testing/debugging).")
     
     args = parser.parse_args()
 
@@ -324,6 +368,31 @@ def main():
     # Build tokenizer.
     args.tokenizer = str2tokenizer[args.tokenizer](args)
 
+    # 在训练开始前一次性读取所有数据集
+    print("Loading datasets...")
+    trainset = read_dataset(args, args.train_path, args.max_train_samples)
+    devset = read_dataset(args, args.dev_path, args.max_dev_samples)
+    if args.test_path is not None:
+        testset = read_dataset(args, args.test_path, args.max_test_samples)
+    else:
+        testset = None
+    
+    # 创建数据加载器
+    print("Creating data loaders...")
+    batch_size = args.batch_size
+    train_loader = create_dataloader(args, trainset, batch_size, shuffle=True)
+    dev_loader = create_dataloader(args, devset, batch_size, shuffle=False)
+    if testset is not None:
+        test_loader = create_dataloader(args, testset, batch_size, shuffle=False)
+    
+    # 计算训练步数
+    args.train_steps = len(train_loader) * args.epochs_num
+
+    print("Batch size: ", batch_size)
+    print("The number of training instances:", len(trainset))
+    print("The number of training steps per epoch:", len(train_loader))
+    print("Total training steps:", args.train_steps)
+
     # Build classification model.
     model = Classifier(args)
 
@@ -332,54 +401,53 @@ def main():
         model.load_state_dict(torch.load(args.pretrained_model_path, map_location=device), strict=False)
     
     model = model.to(device)
-
-    # Training phase.
-    trainset = read_dataset(args, args.train_path)
-    random.shuffle(trainset)
-    instances_num = len(trainset)
-    batch_size = args.batch_size
-    
-    src = torch.LongTensor([example[0] for example in trainset])
-    tgt = torch.LongTensor([example[1] for example in trainset])
-    seg = torch.LongTensor([example[2] for example in trainset])
-    if args.soft_targets:
-        soft_tgt = torch.FloatTensor([example[3] for example in trainset])
-    else:
-        soft_tgt = None
-
-    args.train_steps = int(instances_num * args.epochs_num / batch_size) + 1
-
-    print("Batch size: ", batch_size)
-    print("The number of training instances:", instances_num)
+    args.model = model
 
     optimizer, scheduler = build_optimizer(args, model)
 
-    total_loss, result, best_result = 0.0, 0.0, 0.0
+    total_loss, best_result = 0.0, 0.0
 
     print("Start training.")
 
     for epoch in tqdm.tqdm(range(1, args.epochs_num + 1)):
         model.train()
-        for i, (src_batch, tgt_batch, seg_batch, soft_tgt_batch) in enumerate(batch_loader(batch_size, src, tgt, seg, soft_tgt)):
+        for i, batch in enumerate(train_loader):
+            if len(batch) == 4:  # 包含soft_tgt
+                src_batch, tgt_batch, seg_batch, soft_tgt_batch = batch
+            else:  # 不包含soft_tgt
+                src_batch, tgt_batch, seg_batch = batch
+                soft_tgt_batch = None
+                
+            src_batch = src_batch.to(args.device)
+            tgt_batch = tgt_batch.to(args.device)
+            seg_batch = seg_batch.to(args.device)
+            if soft_tgt_batch is not None:
+                soft_tgt_batch = soft_tgt_batch.to(args.device)
+            
             loss = train_model(args, model, optimizer, scheduler, src_batch, tgt_batch, seg_batch, soft_tgt_batch)
             total_loss += loss.item()
+            
             if (i + 1) % args.report_steps == 0:
                 print("Epoch id: {}, Training steps: {}, Avg loss: {:.3f}".format(epoch, i + 1, total_loss / args.report_steps))
                 total_loss = 0.0
 
-        result = evaluate(args, read_dataset(args, args.dev_path))
-        if result[0] > best_result:
-            best_result = result[0]
+        # 使用验证集评估模型
+        print(f"Evaluating on dev set after epoch {epoch}...")
+        result, _ = evaluate_with_dataloader(args, dev_loader)
+        
+        if result > best_result:
+            best_result = result
             save_model(model, args.output_model_path)
+            print(f"New best result: {best_result:.4f}, model saved to {args.output_model_path}")
 
     # Evaluation phase.
-    if args.test_path is not None:
+    if testset is not None:
         print("Test set evaluation.")
         if torch.cuda.device_count() > 1:
             model.module.load_state_dict(torch.load(args.output_model_path))
         else:
             model.load_state_dict(torch.load(args.output_model_path))
-        evaluate(args, read_dataset(args, args.test_path), True)
+        evaluate_with_dataloader(args, test_loader)
 
     # 确保 max_seq_length 至少等于 seq_length
     if not hasattr(args, 'max_seq_length'):
